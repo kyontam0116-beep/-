@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>無料ボイスメモ文字起こし</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280;
+    --accent: #2563eb; --danger: #dc2626; --border: #e5e7eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111318; --card: #1b1f27; --text: #e7e9ee; --muted: #9aa1ad; --accent: #60a5fa; --danger: #f87171; --border: #2d333d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; font-size: .9rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select { font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.rec { background: var(--danger); border-color: var(--danger); color: #fff; }
+  #status { margin-left: auto; color: var(--muted); font-size: .9rem; }
+  #status.live::before { content: "●"; color: var(--danger); margin-right: 6px; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  textarea { width: 100%; min-height: 320px; resize: vertical; font: inherit; line-height: 1.7; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  #interim { color: var(--muted); min-height: 1.5em; margin: 8px 0 0; font-style: italic; }
+  label { font-size: .9rem; color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+  audio { width: 100%; margin-top: 12px; }
+  .warn { background: #fef3c7; color: #78350f; border-color: #fcd34d; }
+  .hidden { display: none; }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ 無料ボイスメモ文字起こし</h1>
+  <p class="lead">登録不要・完全無料。話した内容をリアルタイムで文字にして、テキストファイルでダウンロードできます。</p>
+
+  <div id="unsupported" class="card warn hidden">
+    このブラウザは音声認識に対応していません。<b>Google Chrome</b>、<b>Microsoft Edge</b>、または <b>Safari</b> で開いてください。
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="startBtn" class="primary">● 録音開始</button>
+      <button id="stopBtn" disabled>■ 停止</button>
+      <select id="lang" aria-label="言語">
+        <option value="ja-JP">日本語</option>
+        <option value="en-US">English</option>
+        <option value="zh-CN">中文</option>
+        <option value="ko-KR">한국어</option>
+      </select>
+      <span id="status">待機中</span>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label><input type="checkbox" id="timestamps" checked> 時刻を付ける</label>
+      <label><input type="checkbox" id="saveAudio" checked> 音声も保存する</label>
+    </div>
+    <p id="interim"></p>
+  </div>
+
+  <div class="card">
+    <textarea id="transcript" placeholder="ここに文字起こしが表示されます（手で修正もできます）"></textarea>
+    <div class="row" style="margin-top:12px">
+      <button id="downloadTxt">⬇ テキストをダウンロード (.txt)</button>
+      <button id="copyBtn">📋 コピー</button>
+      <button id="clearBtn">🗑 クリア</button>
+    </div>
+    <small>入力内容はこのブラウザに自動保存されます。</small>
+  </div>
+
+  <div id="audioCard" class="card hidden">
+    <b>録音した音声</b>
+    <audio id="player" controls></audio>
+    <div class="row" style="margin-top:12px">
+      <button id="downloadAudio">⬇ 音声をダウンロード</button>
+    </div>
+  </div>
+
+  <small>※ 音声認識はブラウザ標準の機能（Web Speech API）を使用します。Chrome / Edge では認識のため音声がブラウザ提供元のサーバーに送られます。</small>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const STORAGE_KEY = 'voicememo-transcript';
+
+  const startBtn = $('startBtn'), stopBtn = $('stopBtn'), statusEl = $('status');
+  const transcriptEl = $('transcript'), interimEl = $('interim');
+
+  let recognition = null, listening = false;
+  let mediaRecorder = null, chunks = [], audioBlob = null, audioUrl = null;
+
+  try { transcriptEl.value = localStorage.getItem(STORAGE_KEY) || ''; } catch {}
+  const persist = () => { try { localStorage.setItem(STORAGE_KEY, transcriptEl.value); } catch {} };
+  transcriptEl.addEventListener('input', persist);
+
+  if (!SR) {
+    $('unsupported').classList.remove('hidden');
+    startBtn.disabled = true;
+  }
+
+  const setStatus = (text, live) => {
+    statusEl.textContent = text;
+    statusEl.classList.toggle('live', !!live);
+  };
+
+  const timeLabel = () => {
+    const d = new Date();
+    return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+  };
+
+  const appendLine = text => {
+    text = text.trim();
+    if (!text) return;
+    const line = $('timestamps').checked ? `[${timeLabel()}] ${text}` : text;
+    const cur = transcriptEl.value;
+    transcriptEl.value = cur + (cur && !cur.endsWith('\n') ? '\n' : '') + line + '\n';
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    persist();
+  };
+
+  function createRecognition() {
+    const r = new SR();
+    r.lang = $('lang').value;
+    r.continuous = true;
+    r.interimResults = true;
+    r.onresult = e => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) appendLine(res[0].transcript);
+        else interim += res[0].transcript;
+      }
+      interimEl.textContent = interim;
+    };
+    r.onerror = e => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        alert('マイクの使用が許可されていません。ブラウザの設定でマイクを許可してください。');
+        stop();
+      }
+      // "no-speech" や "network" は onend で自動再開する
+    };
+    // 無音が続くとブラウザが認識を終了するので、録音中なら自動で再開する
+    r.onend = () => {
+      if (listening) {
+        try { r.start(); } catch { setTimeout(() => listening && r.start(), 300); }
+      }
+    };
+    return r;
+  }
+
+  async function start() {
+    if (!SR || listening) return;
+
+    if ($('saveAudio').checked && navigator.mediaDevices && window.MediaRecorder) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        chunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+        mediaRecorder.onstop = () => {
+          stream.getTracks().forEach(t => t.stop());
+          audioBlob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          if (audioUrl) URL.revokeObjectURL(audioUrl);
+          audioUrl = URL.createObjectURL(audioBlob);
+          $('player').src = audioUrl;
+          $('audioCard').classList.remove('hidden');
+        };
+        mediaRecorder.start();
+      } catch (err) {
+        mediaRecorder = null;
+        console.warn('音声録音を開始できませんでした', err);
+      }
+    }
+
+    recognition = createRecognition();
+    listening = true;
+    try { recognition.start(); } catch {}
+    startBtn.disabled = true; startBtn.classList.replace('primary', 'rec');
+    stopBtn.disabled = false; $('lang').disabled = true;
+    setStatus('録音中…', true);
+  }
+
+  function stop() {
+    listening = false;
+    if (recognition) { try { recognition.stop(); } catch {} }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    if (interimEl.textContent) { appendLine(interimEl.textContent); interimEl.textContent = ''; }
+    startBtn.disabled = !SR; startBtn.classList.replace('rec', 'primary');
+    stopBtn.disabled = true; $('lang').disabled = false;
+    setStatus('停止しました');
+  }
+
+  const stamp = () => {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+  };
+
+  const download = (blob, name) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+
+  startBtn.onclick = start;
+  stopBtn.onclick = stop;
+
+  $('downloadTxt').onclick = () => {
+    if (!transcriptEl.value.trim()) return alert('文字起こしがまだありません。');
+    // BOM 付き UTF-8 で Windows のメモ帳でも文字化けしないようにする
+    download(new Blob(['﻿' + transcriptEl.value], { type: 'text/plain;charset=utf-8' }), `文字起こし_${stamp()}.txt`);
+  };
+
+  $('downloadAudio').onclick = () => {
+    if (!audioBlob) return;
+    const ext = audioBlob.type.includes('mp4') ? 'm4a' : audioBlob.type.includes('ogg') ? 'ogg' : 'webm';
+    download(audioBlob, `ボイスメモ_${stamp()}.${ext}`);
+  };
+
+  $('copyBtn').onclick = async () => {
+    try { await navigator.clipboard.writeText(transcriptEl.value); setStatus('コピーしました'); }
+    catch { transcriptEl.select(); document.execCommand('copy'); }
+  };
+
+  $('clearBtn').onclick = () => {
+    if (transcriptEl.value && !confirm('文字起こしを消去しますか？')) return;
+    transcriptEl.value = '';
+    persist();
+  };
+})();
+</script>
+</body>
+</html>
